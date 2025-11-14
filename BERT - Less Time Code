@@ -1,0 +1,175 @@
+# fast_bert_quick_fixed.py  -- DistilBERT fine-tune (CPU-friendly) with robust TrainingArguments
+import os, re, time
+import numpy as np, pandas as pd
+from datasets import Dataset, DatasetDict
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, TrainingArguments, Trainer
+import evaluate
+
+# ---------- user config: tune these ----------
+DATA_PATH = "labeled_data.csv"   # your file
+SAMPLE_SIZE = 1000               # total examples to use (train+val). Lower -> faster
+TRAIN_SPLIT = 0.8                # fraction for train
+MODEL_NAME = "distilbert-base-uncased"   # much faster than bert-base
+MAX_LEN = 64                     # shorter sequences -> faster
+EPOCHS = 1                       # 1 (or 2 max)
+BATCH_SIZE = 16                  # CPU: 8-32 depending on RAM; lower if OOM
+SEED = 42
+# -------------------------------------------
+
+# 0) quick dependency reminder
+# Ensure accelerate + transformers + torch installed in hf_env:
+# pip install "transformers[torch]" accelerate -U
+
+# 1) load and basic clean
+if not os.path.exists(DATA_PATH):
+    raise FileNotFoundError(f"{DATA_PATH} not found. Put labelled CSV here with columns 'tweet' and 'class'.")
+
+df = pd.read_csv(DATA_PATH).dropna()
+def clean_text(text):
+    s = str(text)
+    s = re.sub(r"http\S+", "", s)
+    s = re.sub(r"@\w+", "", s)
+    s = re.sub(r"[^a-zA-Z\s]", " ", s)
+    s = s.lower().strip()
+    return " ".join(s.split())
+
+df["clean_tweet"] = df["tweet"].apply(clean_text)
+
+# 2) sample to limit runtime
+if SAMPLE_SIZE is not None and SAMPLE_SIZE < len(df):
+    df = df.sample(n=SAMPLE_SIZE, random_state=SEED).reset_index(drop=True)
+print("Using dataset size:", len(df))
+
+# 3) train/val split
+from sklearn.model_selection import train_test_split
+train_df, val_df = train_test_split(
+    df[["clean_tweet", "class"]].rename(columns={"clean_tweet":"text","class":"label"}),
+    test_size=1-TRAIN_SPLIT,
+    random_state=SEED,
+    stratify=df["class"] if "class" in df.columns else None
+)
+print("Train size:", len(train_df), "Val size:", len(val_df))
+
+# 4) convert to HF dataset
+dataset = DatasetDict({
+    "train": Dataset.from_pandas(train_df),
+    "validation": Dataset.from_pandas(val_df)
+})
+
+# 5) tokenizer and encoding (batched)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+def preprocess(batch):
+    return tokenizer(batch["text"], truncation=True, padding="max_length", max_length=MAX_LEN)
+dataset = dataset.map(preprocess, batched=True)
+
+# remove non-required columns and set torch format
+for split in ["train","validation"]:
+    cols = [c for c in dataset[split].column_names if c not in ("input_ids","attention_mask","label")]
+    if cols:
+        dataset[split] = dataset[split].remove_columns(cols)
+dataset.set_format(type="torch")
+
+# 6) model and metrics
+num_labels = len(np.unique(df["class"]))
+model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=num_labels)
+
+accuracy = evaluate.load("accuracy")
+f1 = evaluate.load("f1")
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=-1)
+    return {"accuracy": accuracy.compute(predictions=preds, references=labels)["accuracy"],
+            "f1": f1.compute(predictions=preds, references=labels, average="weighted")["f1"]}
+
+# -------------------------
+# Robust TrainingArguments builder
+# -------------------------
+def make_training_args(output_dir="./fast_bert_out",
+                       num_train_epochs=1,
+                       per_device_train_batch_size=8,
+                       per_device_eval_batch_size=8,
+                       warmup_steps=0,
+                       logging_steps=50,
+                       learning_rate=2e-5,
+                       weight_decay=0.0,
+                       load_best_model_at_end=False,
+                       seed=42):
+    base = dict(
+        output_dir=output_dir,
+        num_train_epochs=num_train_epochs,
+        per_device_train_batch_size=per_device_train_batch_size,
+        per_device_eval_batch_size=per_device_eval_batch_size,
+        warmup_steps=warmup_steps,
+        logging_steps=logging_steps,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        load_best_model_at_end=load_best_model_at_end,
+        seed=seed,
+    )
+    # Try combinations of common keys across transformers versions
+    eval_keys = ["eval_strategy", "evaluation_strategy", "eval_steps", None]
+    save_keys = ["save_strategy", "save_steps", None]
+
+    last_err = None
+    for ek in eval_keys:
+        for sk in save_keys:
+            kwargs = base.copy()
+            if ek is not None:
+                # for strategy-like keys we use "epoch"
+                if ek in ("eval_strategy", "evaluation_strategy"):
+                    kwargs[ek] = "epoch"
+                else:
+                    kwargs[ek] = "epoch"
+            if sk is not None:
+                if sk == "save_strategy":
+                    kwargs[sk] = "no"    # prefer not saving many checkpoints for speed
+                elif sk == "save_steps":
+                    kwargs[sk] = 10000  # very large so effectively none
+            try:
+                return TrainingArguments(**kwargs)
+            except TypeError as e:
+                last_err = e
+                continue
+    # final fallback: minimal args
+    try:
+        return TrainingArguments(**base)
+    except Exception as e:
+        raise last_err or e
+
+# Create training args (fast config)
+training_args = make_training_args(
+    output_dir="./fast_bert_out",
+    num_train_epochs=EPOCHS,
+    per_device_train_batch_size=BATCH_SIZE,
+    per_device_eval_batch_size=BATCH_SIZE,
+    warmup_steps=0,
+    logging_steps=50,
+    learning_rate=2e-5,
+    weight_decay=0.0,
+    load_best_model_at_end=False,
+    seed=SEED
+)
+
+print("Using TrainingArguments keys:", list(training_args.to_sanitized_dict().keys()))
+
+# 7) Trainer & train
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=dataset["train"],
+    eval_dataset=dataset["validation"],
+    tokenizer=tokenizer,
+    compute_metrics=compute_metrics
+)
+
+t0 = time.time()
+trainer.train()
+t1 = time.time()
+print(f"Training time: {t1-t0:.1f} seconds")
+
+# 8) eval & save
+metrics = trainer.evaluate()
+print("Eval metrics:", metrics)
+trainer.save_model("./fast_bert_saved")
+tokenizer.save_pretrained("./fast_bert_saved")
+print("Saved to ./fast_bert_saved")
