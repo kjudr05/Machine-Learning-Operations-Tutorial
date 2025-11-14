@@ -1,0 +1,270 @@
+# full_pipeline_fixed.py
+"""
+Full pipeline:
+- Loads labeled_data.csv
+- TF-IDF -> Logistic Regression
+- TF-IDF -> Random Forest
+- LSTM -> TensorFlow if available else skip (PyTorch LSTM fallback not included here)
+- BERT -> Hugging Face Trainer (robust TrainingArguments builder)
+Note: Make sure this runs in an environment with torch + transformers + datasets + evaluate + accelerate installed.
+"""
+
+import os, re, sys, numpy as np, pandas as pd
+
+# sklearn
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, accuracy_score
+
+# env check
+print("Python:", sys.version.split()[0])
+
+# Try TF
+try:
+    import tensorflow as tf
+    TF_AVAILABLE = True
+    print("TensorFlow:", tf.__version__)
+except Exception:
+    TF_AVAILABLE = False
+    print("TensorFlow NOT available (will skip TF LSTM)")
+
+# Try Torch + HF
+try:
+    import torch
+    TORCH_AVAILABLE = True
+    print("Torch:", torch.__version__)
+except Exception:
+    TORCH_AVAILABLE = False
+    print("Torch NOT available")
+
+try:
+    import transformers
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification, TrainingArguments, Trainer
+    from datasets import Dataset, DatasetDict
+    import evaluate
+    HF_AVAILABLE = True
+    print("Transformers:", transformers.__version__)
+except Exception as e:
+    HF_AVAILABLE = False
+    print("Transformers NOT available:", e)
+
+# -------------------------
+# Helper: robust TrainingArguments builder
+# -------------------------
+def make_training_args(output_dir="./bert_out",
+                       num_train_epochs=2,
+                       per_device_train_batch_size=8,
+                       per_device_eval_batch_size=8,
+                       warmup_steps=100,
+                       logging_steps=20,
+                       learning_rate=2e-5,
+                       weight_decay=0.01,
+                       load_best_model_at_end=True,
+                       seed=42):
+    base = dict(
+        output_dir=output_dir,
+        num_train_epochs=num_train_epochs,
+        per_device_train_batch_size=per_device_train_batch_size,
+        per_device_eval_batch_size=per_device_eval_batch_size,
+        warmup_steps=warmup_steps,
+        logging_steps=logging_steps,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        load_best_model_at_end=load_best_model_at_end,
+        seed=seed,
+    )
+    eval_keys = ["eval_strategy", "evaluation_strategy", None]
+    save_keys = ["save_strategy", "save_steps", None]
+
+    last_err = None
+    for ek in eval_keys:
+        for sk in save_keys:
+            kwargs = base.copy()
+            if ek is not None:
+                kwargs[ek] = "epoch"
+            if sk is not None:
+                if sk == "save_strategy":
+                    kwargs[sk] = "epoch"
+                elif sk == "save_steps":
+                    kwargs[sk] = 500
+            try:
+                return TrainingArguments(**kwargs)
+            except TypeError as e:
+                last_err = e
+                continue
+    # final minimal fallback
+    try:
+        return TrainingArguments(**base)
+    except Exception as e:
+        raise last_err or e
+
+# -------------------------
+# Load dataset
+# -------------------------
+DATA_PATH = "labeled_data.csv"
+if not os.path.exists(DATA_PATH):
+    raise FileNotFoundError(f"{DATA_PATH} not found. Place your CSV in the working directory with columns 'tweet' and 'class'.")
+
+df = pd.read_csv(DATA_PATH).dropna()
+print("Loaded dataset:", df.shape)
+print(df.head())
+
+# -------------------------
+# Clean text
+# -------------------------
+import nltk
+from nltk.corpus import stopwords
+try:
+    stopwords.words("english")
+except Exception:
+    nltk.download("stopwords", quiet=True)
+
+def clean_text(text):
+    s = str(text)
+    s = re.sub(r"http\S+", "", s)
+    s = re.sub(r"@\w+", "", s)
+    s = re.sub(r"[^a-zA-Z\s]", " ", s)
+    s = s.lower().strip()
+    sw = set(stopwords.words("english"))
+    s = " ".join([w for w in s.split() if w not in sw])
+    return s
+
+df["clean_tweet"] = df["tweet"].apply(clean_text)
+
+# -------------------------
+# Split
+# -------------------------
+X = df["clean_tweet"]
+y = df["class"]
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+print("Train:", len(X_train), "Test:", len(X_test))
+
+# -------------------------
+# LR (TF-IDF)
+# -------------------------
+vectorizer = TfidfVectorizer(max_features=5000, ngram_range=(1,2))
+X_train_tfidf = vectorizer.fit_transform(X_train)
+X_test_tfidf = vectorizer.transform(X_test)
+
+lr = LogisticRegression(max_iter=300)
+lr.fit(X_train_tfidf, y_train)
+y_lr = lr.predict(X_test_tfidf)
+lr_acc = accuracy_score(y_test, y_lr)
+print("\nLogistic Regression accuracy:", lr_acc)
+print(classification_report(y_test, y_lr))
+
+# -------------------------
+# Random Forest
+# -------------------------
+rf = RandomForestClassifier(n_estimators=200, random_state=42)
+rf.fit(X_train_tfidf, y_train)
+y_rf = rf.predict(X_test_tfidf)
+rf_acc = accuracy_score(y_test, y_rf)
+print("\nRandom Forest accuracy:", rf_acc)
+print(classification_report(y_test, y_rf))
+
+# -------------------------
+# LSTM (TensorFlow) - optional
+# -------------------------
+lstm_acc = 0.0
+if TF_AVAILABLE:
+    print("\nTraining LSTM (TensorFlow)...")
+    from tensorflow.keras.preprocessing.text import Tokenizer
+    from tensorflow.keras.preprocessing.sequence import pad_sequences
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import Embedding, LSTM, Bidirectional, Dense, Dropout
+
+    vocab_size = 20000
+    max_len = 100
+    tokenizer_tf = Tokenizer(num_words=vocab_size, oov_token="<OOV>")
+    tokenizer_tf.fit_on_texts(X_train)
+
+    X_train_seq = tokenizer_tf.texts_to_sequences(X_train)
+    X_test_seq = tokenizer_tf.texts_to_sequences(X_test)
+    X_train_pad = pad_sequences(X_train_seq, maxlen=max_len, padding="post")
+    X_test_pad = pad_sequences(X_test_seq, maxlen=max_len, padding="post")
+
+    model = Sequential([
+        Embedding(vocab_size, 100, input_length=max_len),
+        Bidirectional(LSTM(128, dropout=0.3)),
+        Dense(64, activation="relu"),
+        Dropout(0.3),
+        Dense(len(np.unique(y)), activation="softmax")
+    ])
+    model.compile(loss="sparse_categorical_crossentropy", optimizer="adam", metrics=["accuracy"])
+    model.fit(X_train_pad, y_train, epochs=5, batch_size=64, validation_split=0.1, verbose=1)
+    loss, lstm_acc = model.evaluate(X_test_pad, y_test)
+    print("LSTM accuracy:", lstm_acc)
+else:
+    print("\nSkipping LSTM (TensorFlow not available).")
+
+# -------------------------
+# BERT fine-tuning (Trainer) - only if HF + Torch available
+# -------------------------
+bert_acc = 0.0
+if HF_AVAILABLE and TORCH_AVAILABLE:
+    print("\nStarting BERT fine-tuning... (this may be slow on CPU)")
+    train_df = pd.DataFrame({"text": X_train.values, "label": y_train.values})
+    val_df = pd.DataFrame({"text": X_test.values, "label": y_test.values})
+    dataset = DatasetDict({"train": Dataset.from_pandas(train_df), "validation": Dataset.from_pandas(val_df)})
+
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased", use_fast=True)
+    def preprocess(batch):
+        return tokenizer(batch["text"], truncation=True, padding="max_length", max_length=128)
+
+    dataset_enc = dataset.map(preprocess, batched=True)
+    # remove any extra columns and set torch format
+    for split in ["train", "validation"]:
+        cols = [c for c in dataset_enc[split].column_names if c not in ("input_ids", "attention_mask", "label")]
+        if cols:
+            dataset_enc[split] = dataset_enc[split].remove_columns(cols)
+    dataset_enc.set_format(type="torch")
+
+    num_labels = len(np.unique(y))
+    bert_model = AutoModelForSequenceClassification.from_pretrained("bert-base-uncased", num_labels=num_labels)
+
+    accuracy = evaluate.load("accuracy")
+    f1 = evaluate.load("f1")
+    def compute_metrics(eval_pred):
+        logits, labels = eval_pred
+        preds = np.argmax(logits, axis=-1)
+        return {"accuracy": accuracy.compute(predictions=preds, references=labels)["accuracy"],
+                "f1": f1.compute(predictions=preds, references=labels, average="weighted")["f1"]}
+
+    training_args = make_training_args(output_dir="./bert_out",
+                                       num_train_epochs=2,
+                                       per_device_train_batch_size=8,
+                                       per_device_eval_batch_size=8,
+                                       warmup_steps=100,
+                                       logging_steps=20,
+                                       learning_rate=2e-5,
+                                       weight_decay=0.01,
+                                       load_best_model_at_end=True,
+                                       seed=42)
+
+    print("Using TrainingArguments keys:", list(training_args.to_sanitized_dict().keys()))
+    trainer = Trainer(model=bert_model,
+                      args=training_args,
+                      train_dataset=dataset_enc["train"],
+                      eval_dataset=dataset_enc["validation"],
+                      tokenizer=tokenizer,
+                      compute_metrics=compute_metrics)
+
+    trainer.train()
+    metrics = trainer.evaluate()
+    bert_acc = float(metrics.get("eval_accuracy", 0.0))
+    print("BERT eval metrics:", metrics)
+else:
+    print("\nSkipping BERT (transformers or torch not available).")
+
+# -------------------------
+# Final table
+# -------------------------
+results = pd.DataFrame({
+    "Model": ["Logistic Regression", "Random Forest", "LSTM", "BERT"],
+    "Accuracy": [float(lr_acc), float(rf_acc), float(lstm_acc if 'lstm_acc' in locals() else 0.0), float(bert_acc)]
+})
+print("\nFINAL MODEL COMPARISON")
+print(results.sort_values("Accuracy", ascending=False).reset_index(drop=True))
